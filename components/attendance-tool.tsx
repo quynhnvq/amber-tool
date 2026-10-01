@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import {
   formatDate,
   formatTotal,
@@ -43,28 +43,46 @@ function readIncludeNotes(): boolean {
   }
 }
 
+const graceListeners = new Set<() => void>();
+let graceValue = defaultGrace;
+let graceHydrated = false;
+
+function hydrateGrace() {
+  if (graceHydrated) return;
+  graceHydrated = true;
+  graceValue = readGrace();
+}
+
+function subscribeGrace(listener: () => void) {
+  graceListeners.add(listener);
+  return () => {
+    graceListeners.delete(listener);
+  };
+}
+
+function graceSnapshot() {
+  hydrateGrace();
+  return graceValue;
+}
+
+function setGraceValue(value: number) {
+  graceValue = Math.max(0, value);
+  graceHydrated = true;
+  try {
+    localStorage.setItem(graceKey, String(graceValue));
+  } catch {
+    // Keep the in-page value when storage is unavailable.
+  }
+  graceListeners.forEach((listener) => listener());
+}
+
 export function AttendanceTool() {
   const [parsed, setParsed] = useState<ParsedAttendance | null>(null);
   const [fileName, setFileName] = useState("");
-  const [grace, setGrace] = useState(defaultGrace);
-  const [graceReady, setGraceReady] = useState(false);
+  const grace = useSyncExternalStore(subscribeGrace, graceSnapshot, () => defaultGrace);
   const [error, setError] = useState("");
   const [reading, setReading] = useState(false);
   const [exporting, setExporting] = useState(false);
-
-  useEffect(() => {
-    setGrace(readGrace());
-    setGraceReady(true);
-  }, []);
-
-  useEffect(() => {
-    if (!graceReady) return;
-    try {
-      localStorage.setItem(graceKey, String(grace));
-    } catch {
-      // Keep the in-page value when storage is unavailable.
-    }
-  }, [grace, graceReady]);
 
   const summary = useMemo(() => (parsed ? summarize(parsed, grace) : null), [parsed, grace]);
   const window = graceWindow(grace);
@@ -159,7 +177,7 @@ export function AttendanceTool() {
             min={0}
             max={180}
             value={grace}
-            onChange={(event) => setGrace(Math.max(0, Number(event.target.value) || 0))}
+            onChange={(event) => setGraceValue(Math.max(0, Number(event.target.value) || 0))}
           />
           <span className="text-xs leading-5 text-slate-500">
             Đến {window.morningIn} vẫn kịp giờ sáng, tan sáng từ {window.morningOut}. Đến {window.afternoonIn} kịp giờ chiều, tan chiều từ {window.afternoonOut}. Chỉ tính giờ vào từ 06:00 và giờ về trước 19:00.
@@ -225,6 +243,13 @@ function Result({
   const [rows, setRows] = useState<DraftRow[]>(() => toDraft(summary));
   const [includeNotes, setIncludeNotes] = useState(readIncludeNotes);
   const [openRows, setOpenRows] = useState<Record<number, boolean>>({});
+  const [renderedSummary, setRenderedSummary] = useState(summary);
+
+  if (summary !== renderedSummary) {
+    setRenderedSummary(summary);
+    setRows(toDraft(summary));
+    setOpenRows({});
+  }
 
   useEffect(() => {
     try {
@@ -233,11 +258,6 @@ function Result({
       // Keep the in-page choice when storage is unavailable.
     }
   }, [includeNotes]);
-
-  useEffect(() => {
-    setRows(toDraft(summary));
-    setOpenRows({});
-  }, [summary]);
 
   const notesByRow = useMemo(
     () =>
@@ -362,28 +382,35 @@ function EmployeeRows({
             {open ? "▾" : "▸"}
           </button>
         </td>
-        {columns.map((column) => (
-          <td key={column.key} className="border border-slate-200 p-1 align-top">
-            {column.key === "total" ? (
-              <div
-                aria-label={`${column.label} của dòng ${index + 1}`}
-                className="min-h-8 px-2 py-2 text-center text-base font-semibold text-slate-900"
-              >
-                {row.total}
-              </div>
-            ) : (
+        {columns.map((column) => {
+          if (column.key === "total") {
+            return (
+              <td key={column.key} className="border border-slate-200 p-1 align-top">
+                <div
+                  aria-label={`${column.label} của dòng ${index + 1}`}
+                  className="min-h-8 px-2 py-2 text-center text-base font-semibold text-slate-900"
+                >
+                  {row.total}
+                </div>
+              </td>
+            );
+          }
+
+          const key = column.key;
+          return (
+            <td key={key} className="border border-slate-200 p-1 align-top">
               <textarea
                 aria-label={`${column.label} của dòng ${index + 1}`}
-                value={row[column.key]}
+                value={row[key]}
                 rows={1}
-                onChange={(event) => onChange(column.key, event.target.value)}
+                onChange={(event) => onChange(key, event.target.value)}
                 className={`field-sizing-content min-h-8 w-full resize-none bg-transparent px-2 py-2 text-sm text-slate-900 outline-none focus:bg-amber-50 ${
                   column.bold ? "font-semibold" : ""
                 }`}
               />
-            )}
-          </td>
-        ))}
+            </td>
+          );
+        })}
       </tr>
       {open ? (
         <tr>
