@@ -17,3 +17,27 @@ body {
   color: #0f172a;
   font-family: Arial, Helvetica, sans-serif;
 }
+
+.amber-calendar.rdp-root {
+  --rdp-accent-color: #d97706;
+  --rdp-accent-background-color: #fef3c7;
+  --rdp-today-color: #b45309;
+  --rdp-day-height: 38px;
+  --rdp-day-width: 40px;
+  --rdp-day_button-height: 36px;
+  --rdp-day_button-width: 36px;
+  --rdp-nav_button-height: 2rem;
+  --rdp-nav_button-width: 2rem;
+  --rdp-nav-height: 2.5rem;
+  font-size: 0.875rem;
+}
+
+.amber-calendar.rdp-root .rdp-selected .rdp-day_button {
+  background: var(--rdp-accent-color);
+  color: #fff;
+  border-color: var(--rdp-accent-color);
+}
+
+.amber-calendar.rdp-root .rdp-month_caption {
+  font-size: 0.95rem;
+}

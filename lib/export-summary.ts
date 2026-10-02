@@ -40,21 +40,21 @@ export async function summaryToBuffer(summary: AttendanceSummary, includeNotes =
     right: { style: "thin" as const, color: { argb: LINE } },
   };
 
-  sheet.mergeCells("A1:E1");
+  sheet.mergeCells("A1:F1");
   const title = sheet.getCell("A1");
   title.value = summary.title;
   title.font = { name: "Arial", bold: true, size: 16, color: { argb: NAVY } };
   title.alignment = { horizontal: "center", vertical: "middle" };
   sheet.getRow(1).height = 28;
 
-  sheet.mergeCells("A2:E2");
+  sheet.mergeCells("A2:F2");
   const period = sheet.getCell("A2");
   period.value = summary.periodLabel;
   period.font = { name: "Arial", size: 11, color: { argb: "FF475569" } };
   period.alignment = { horizontal: "center" };
 
   const header = sheet.getRow(3);
-  ["HỌ VÀ TÊN", "SÁNG", "CHIỀU", "NGUYÊN NGÀY", "TỔNG NGÀY NGHỈ"].forEach((label, index) => {
+  ["HỌ VÀ TÊN", "SÁNG", "CHIỀU", "NGUYÊN NGÀY", "QUÊN / KHÔNG CHẤM CÔNG", "TỔNG NGÀY NGHỈ"].forEach((label, index) => {
     const cell = header.getCell(index + 1);
     cell.value = label;
     cell.font = { name: "Arial", bold: true, size: 11, color: { argb: NAVY } };
@@ -62,43 +62,47 @@ export async function summaryToBuffer(summary: AttendanceSummary, includeNotes =
     cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
     cell.border = border;
   });
-  header.height = 22;
+  header.height = 32;
 
   summary.rows.forEach((row, index) => {
     const excelRow = sheet.getRow(4 + index);
     const total = totalCellValue(row.total);
-    const values: Array<string | number> = [row.name, row.morning, row.afternoon, row.fullDay, total];
+    const punchText = String(row.punch ?? "").replace(/; /g, "\n");
+    const values: Array<string | number> = [row.name, row.morning, row.afternoon, row.fullDay, punchText, total];
+    const lineCount = punchText ? punchText.split("\n").length : 1;
+    excelRow.height = Math.max(22, lineCount * 18);
     values.forEach((value, column) => {
       const cell = excelRow.getCell(column + 1);
       cell.value = value;
-      cell.font = { name: "Arial", size: 11, bold: column === 4 };
+      cell.font = { name: "Arial", size: 11, bold: column === 5 };
       cell.border = border;
       cell.alignment = {
-        horizontal: column === 4 ? "center" : "left",
-        vertical: "middle",
+        horizontal: column === 5 ? "center" : "left",
+        vertical: column === 4 ? "top" : "middle",
         wrapText: true,
       };
-      if (column === 4 && typeof value === "number") {
+      if (column === 5 && typeof value === "number") {
         cell.numFmt = Number.isInteger(value) ? "0" : "0.0";
       }
     });
   });
 
   sheet.getColumn(1).width = 24;
-  sheet.getColumn(2).width = 28;
-  sheet.getColumn(3).width = 28;
-  sheet.getColumn(4).width = 36;
-  sheet.getColumn(5).width = 18;
+  sheet.getColumn(2).width = 24;
+  sheet.getColumn(3).width = 24;
+  sheet.getColumn(4).width = 32;
+  sheet.getColumn(5).width = 46;
+  sheet.getColumn(6).width = 16;
 
   if (includeNotes) {
     const noteTitleRow = summary.rows.length + 5;
-    sheet.mergeCells(noteTitleRow, 1, noteTitleRow, 5);
+    sheet.mergeCells(noteTitleRow, 1, noteTitleRow, 6);
     const noteTitle = sheet.getCell(noteTitleRow, 1);
-    noteTitle.value = "Ghi chú — ngày nghỉ, có chấm công hoặc không";
+    noteTitle.value = "Ghi chú — ngày nghỉ và quên chấm công";
     noteTitle.font = { name: "Arial", bold: true, size: 12, color: { argb: "FF9A3412" } };
 
     if (summary.notes.length === 0) {
-      sheet.mergeCells(noteTitleRow + 1, 1, noteTitleRow + 1, 5);
+      sheet.mergeCells(noteTitleRow + 1, 1, noteTitleRow + 1, 6);
       const empty = sheet.getCell(noteTitleRow + 1, 1);
       empty.value = "Không có ngày nghỉ.";
       empty.font = { name: "Arial", size: 11, italic: true, color: { argb: "FF64748B" } };

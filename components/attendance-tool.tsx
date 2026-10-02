@@ -1,15 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { DateField } from "@/components/date-field";
 import {
   formatDate,
   formatTotal,
   graceWindow,
+  isExcludedDate,
   leaveTotal,
+  normalizeExcludedSpan,
   notesMatchingRows,
+  parseIsoDate,
   parseWorkbook,
+  punchNoteSession,
   summarize,
+  toIsoDate,
   type AttendanceSummary,
+  type CalendarDate,
+  type ExcludedSpan,
   type ParsedAttendance,
   type ParsedEmployee,
   type PunchDay,
@@ -18,7 +26,9 @@ import {
 
 const graceKey = "amber-tool.grace-minutes";
 const includeNotesKey = "amber-tool.include-notes";
+const excludedKey = "amber-tool.excluded-spans";
 const defaultGrace = 15;
+const emptyExcluded: ExcludedSpan[] = [];
 
 function clampGrace(value: number): number {
   if (!Number.isFinite(value)) return defaultGrace;
@@ -76,15 +86,105 @@ function setGraceValue(value: number) {
   graceListeners.forEach((listener) => listener());
 }
 
+const excludedListeners = new Set<() => void>();
+let excludedValue: ExcludedSpan[] = emptyExcluded;
+let excludedHydrated = false;
+
+function readExcluded(): ExcludedSpan[] {
+  try {
+    const raw = localStorage.getItem(excludedKey);
+    if (!raw) return emptyExcluded;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return emptyExcluded;
+    const spans = parsed.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const record = item as { start?: CalendarDate; end?: CalendarDate };
+      if (!record.start || !record.end) return [];
+      const span = normalizeExcludedSpan(record.start, record.end);
+      return span ? [span] : [];
+    });
+    return spans.length > 0 ? sortSpans(spans) : emptyExcluded;
+  } catch {
+    return emptyExcluded;
+  }
+}
+
+function spanKey(span: ExcludedSpan): string {
+  return `${toIsoDate(span.start)}:${toIsoDate(span.end)}`;
+}
+
+function sortSpans(spans: ExcludedSpan[]): ExcludedSpan[] {
+  return [...spans].sort((left, right) => spanKey(left).localeCompare(spanKey(right)));
+}
+
+function hydrateExcluded() {
+  if (excludedHydrated) return;
+  excludedHydrated = true;
+  excludedValue = readExcluded();
+}
+
+function subscribeExcluded(listener: () => void) {
+  excludedListeners.add(listener);
+  return () => {
+    excludedListeners.delete(listener);
+  };
+}
+
+function excludedSnapshot() {
+  hydrateExcluded();
+  return excludedValue;
+}
+
+function commitExcluded(next: ExcludedSpan[]) {
+  excludedValue = next.length > 0 ? sortSpans(next) : emptyExcluded;
+  excludedHydrated = true;
+  try {
+    localStorage.setItem(excludedKey, JSON.stringify(excludedValue));
+  } catch {
+    // Keep the in-page value when storage is unavailable.
+  }
+  excludedListeners.forEach((listener) => listener());
+}
+
+function addExcludedSpan(start: CalendarDate, end: CalendarDate): "added" | "duplicate" | "invalid" {
+  const span = normalizeExcludedSpan(start, end);
+  if (!span) return "invalid";
+  hydrateExcluded();
+  const key = spanKey(span);
+  const exists = excludedValue.some((item) => spanKey(item) === key);
+  if (exists) return "duplicate";
+  commitExcluded([...excludedValue, span]);
+  return "added";
+}
+
+function removeExcludedSpan(index: number) {
+  hydrateExcluded();
+  commitExcluded(excludedValue.filter((_, itemIndex) => itemIndex !== index));
+}
+
+function spanLabel(span: ExcludedSpan): string {
+  const start = `${formatDate(span.start)}/${span.start.year}`;
+  const end = `${formatDate(span.end)}/${span.end.year}`;
+  return start === end ? start : `${start} – ${end}`;
+}
+
+function spanTouchesPeriod(span: ExcludedSpan, start: CalendarDate, end: CalendarDate): boolean {
+  return toIsoDate(span.end) >= toIsoDate(start) && toIsoDate(span.start) <= toIsoDate(end);
+}
+
 export function AttendanceTool() {
   const [parsed, setParsed] = useState<ParsedAttendance | null>(null);
   const [fileName, setFileName] = useState("");
   const grace = useSyncExternalStore(subscribeGrace, graceSnapshot, () => defaultGrace);
+  const excluded = useSyncExternalStore(subscribeExcluded, excludedSnapshot, () => emptyExcluded);
   const [error, setError] = useState("");
   const [reading, setReading] = useState(false);
   const [exporting, setExporting] = useState(false);
 
-  const summary = useMemo(() => (parsed ? summarize(parsed, grace) : null), [parsed, grace]);
+  const summary = useMemo(
+    () => (parsed ? summarize(parsed, grace, excluded) : null),
+    [parsed, grace, excluded],
+  );
   const window = graceWindow(grace);
 
   async function onFile(file: File | undefined) {
@@ -147,7 +247,7 @@ export function AttendanceTool() {
         <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Tổng hợp ngày nghỉ</h1>
         <p className="max-w-3xl text-base leading-7 text-slate-600">
           Tải file chấm công gốc. Bảng bên dưới gom các ngày hoặc khoảng ngày nghỉ của từng nhân viên.
-          Thứ 7 chỉ tính buổi sáng, Chủ nhật không tính.
+          Thứ 7 chỉ tính buổi sáng, Chủ nhật không tính. Ngày lễ hoặc khoảng ngày loại trừ không có chấm công vẫn tính là đi làm.
         </p>
       </header>
 
@@ -185,6 +285,8 @@ export function AttendanceTool() {
         </label>
       </section>
 
+      <ExcludedDays period={parsed ? { start: parsed.start, end: parsed.end } : null} spans={excluded} />
+
       {error ? (
         <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>
       ) : null}
@@ -193,6 +295,7 @@ export function AttendanceTool() {
         <Result
           summary={summary}
           employees={parsed.employees}
+          excluded={excluded}
           exporting={exporting}
           onExport={(edited) => void onExport(edited)}
         />
@@ -206,15 +309,17 @@ type DraftRow = {
   morning: string;
   afternoon: string;
   fullDay: string;
+  punch: string;
   total: string;
 };
 
-const columns: Array<{ key: keyof DraftRow; label: string; align: "left" | "center"; bold: boolean }> = [
-  { key: "name", label: "Họ và tên", align: "left", bold: true },
-  { key: "morning", label: "Sáng", align: "left", bold: false },
-  { key: "afternoon", label: "Chiều", align: "left", bold: false },
-  { key: "fullDay", label: "Nguyên ngày", align: "left", bold: false },
-  { key: "total", label: "Tổng ngày nghỉ", align: "center", bold: true },
+const columns: Array<{ key: keyof DraftRow; label: string; align: "left" | "center"; bold: boolean; width: string }> = [
+  { key: "name", label: "Họ và tên", align: "left", bold: true, width: "w-[15%]" },
+  { key: "morning", label: "Sáng", align: "left", bold: false, width: "w-[14%]" },
+  { key: "afternoon", label: "Chiều", align: "left", bold: false, width: "w-[14%]" },
+  { key: "fullDay", label: "Nguyên ngày", align: "left", bold: false, width: "w-[18%]" },
+  { key: "punch", label: "Quên / Không chấm công", align: "left", bold: false, width: "w-[29%]" },
+  { key: "total", label: "Tổng ngày nghỉ", align: "center", bold: true, width: "w-[10%]" },
 ];
 
 function toDraft(summary: AttendanceSummary): DraftRow[] {
@@ -223,20 +328,154 @@ function toDraft(summary: AttendanceSummary): DraftRow[] {
     morning: row.morning,
     afternoon: row.afternoon,
     fullDay: row.fullDay,
+    punch: row.punch,
     total: typeof row.total === "number" ? formatTotal(row.total) : row.total,
   }));
 }
 
 const weekdays = ["CN", "T2", "T3", "T4", "T5", "T6", "T7"];
 
+function ExcludedDays({
+  period,
+  spans,
+}: {
+  period: { start: CalendarDate; end: CalendarDate } | null;
+  spans: ExcludedSpan[];
+}) {
+  const [single, setSingle] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [formError, setFormError] = useState("");
+  const min = period ? toIsoDate(period.start) : undefined;
+  const max = period ? toIsoDate(period.end) : undefined;
+
+  function withinPeriod(value: string): boolean {
+    if (!min || !max) return true;
+    return value >= min && value <= max;
+  }
+
+  function addSingle() {
+    const date = parseIsoDate(single);
+    if (!date) {
+      setFormError("Chọn một ngày hợp lệ.");
+      return;
+    }
+    if (!withinPeriod(single)) {
+      setFormError("Ngày này nằm ngoài kỳ chấm công.");
+      return;
+    }
+    const result = addExcludedSpan(date, date);
+    if (result === "duplicate") {
+      setFormError("Ngày này đã có trong danh sách loại trừ.");
+      return;
+    }
+    setSingle("");
+    setFormError("");
+  }
+
+  function addRange() {
+    const start = parseIsoDate(from);
+    const end = parseIsoDate(to);
+    if (!start || !end) {
+      setFormError("Chọn đủ ngày bắt đầu và kết thúc.");
+      return;
+    }
+    if (!withinPeriod(from) || !withinPeriod(to)) {
+      setFormError("Khoảng ngày nằm ngoài kỳ chấm công.");
+      return;
+    }
+    const result = addExcludedSpan(start, end);
+    if (result === "duplicate") {
+      setFormError("Khoảng ngày này đã có trong danh sách loại trừ.");
+      return;
+    }
+    setFrom("");
+    setTo("");
+    setFormError("");
+  }
+
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h2 className="text-base font-semibold text-slate-900">Ngày loại trừ</h2>
+      <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-500">
+        Thêm ngày lễ hoặc khoảng ngày trong tuần không có chấm công. Những ngày này vẫn tính là đi làm, không đưa vào ngày nghỉ.
+      </p>
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <div className="flex flex-col gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <DateField label="Một ngày" value={single} onChange={setSingle} min={min} max={max} />
+          <button
+            type="button"
+            className="h-11 rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-900 hover:bg-slate-100"
+            onClick={addSingle}
+          >
+            Thêm ngày
+          </button>
+        </div>
+        <div className="flex flex-col gap-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <DateField label="Từ ngày" value={from} onChange={setFrom} min={min} max={max} />
+            <DateField label="Đến ngày" value={to} onChange={setTo} min={min} max={max} />
+          </div>
+          <button
+            type="button"
+            className="h-11 rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-900 hover:bg-slate-100"
+            onClick={addRange}
+          >
+            Thêm khoảng ngày
+          </button>
+        </div>
+      </div>
+      {formError ? <p className="mt-3 text-sm text-red-700">{formError}</p> : null}
+      {spans.length === 0 ? (
+        <p className="mt-3 text-sm text-slate-500">Chưa có ngày loại trừ.</p>
+      ) : (
+        <ul className="mt-3 flex flex-wrap gap-2">
+          {spans.map((span, index) => {
+            const outside = period ? !spanTouchesPeriod(span, period.start, period.end) : false;
+            const label = spanLabel(span);
+            return (
+              <li
+                key={spanKey(span)}
+                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm ${
+                  outside
+                    ? "border-slate-200 bg-slate-100 text-slate-500"
+                    : "border-emerald-200 bg-emerald-50 text-emerald-950"
+                }`}
+              >
+                <span>
+                  {label}
+                  {outside ? " · ngoài kỳ này" : ""}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Bỏ ${label}`}
+                  className="text-base leading-none text-current hover:opacity-70"
+                  onClick={() => {
+                    removeExcludedSpan(index);
+                    setFormError("");
+                  }}
+                >
+                  ×
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function Result({
   summary,
   employees,
+  excluded,
   exporting,
   onExport,
 }: {
   summary: AttendanceSummary;
   employees: ParsedEmployee[];
+  excluded: ExcludedSpan[];
   exporting: boolean;
   onExport: (summary: AttendanceSummary & { includeNotes?: boolean }) => void;
 }) {
@@ -290,7 +529,7 @@ function Result({
           <h2 className="text-center text-xl font-bold tracking-wide text-slate-900 sm:text-left">{summary.title}</h2>
           <p className="text-sm text-slate-500">{summary.periodLabel}</p>
           <p className="mt-1 text-sm text-slate-500">
-            Bấm vào ô ngày để sửa. Tổng ngày nghỉ tính lại theo: sáng và chiều 0,5 ngày, nguyên ngày 1 ngày. Mũi tên cạnh tên mở giờ chấm công và ghi chú trong tháng.
+            Bấm vào ô để sửa. Tổng ngày nghỉ tính lại theo sáng và chiều 0,5 ngày, nguyên ngày 1 ngày. Cột Quên / Không chấm công không cộng vào tổng này. Mũi tên cạnh tên mở giờ chấm công và ghi chú.
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -315,12 +554,12 @@ function Result({
       </div>
 
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
-        <table className="w-full min-w-190 table-fixed border-collapse text-sm">
+        <table className="w-full min-w-275 table-fixed border-collapse text-sm">
           <thead>
             <tr className="bg-slate-100 text-slate-900">
               <th className="w-10 border border-slate-200 px-2 py-3" aria-label="Mở chi tiết" />
               {columns.map((column) => (
-                <th key={column.key} className="border border-slate-200 px-3 py-3 text-center font-semibold">
+                <th key={column.key} className={`border border-slate-200 px-3 py-3 text-center font-semibold ${column.width}`}>
                   {column.label}
                 </th>
               ))}
@@ -337,6 +576,7 @@ function Result({
                   open={open}
                   days={employees[index]?.days ?? []}
                   notes={notesByRow[index] ?? []}
+                  excluded={excluded}
                   onToggle={() => setOpenRows((current) => ({ ...current, [index]: !current[index] }))}
                   onChange={(key, value) => updateRow(index, key, value)}
                 />
@@ -355,6 +595,7 @@ function EmployeeRows({
   open,
   days,
   notes,
+  excluded,
   onToggle,
   onChange,
 }: {
@@ -363,6 +604,7 @@ function EmployeeRows({
   open: boolean;
   days: PunchDay[];
   notes: ReviewNote[];
+  excluded: ExcludedSpan[];
   onToggle: () => void;
   onChange: (key: Exclude<keyof DraftRow, "total">, value: string) => void;
 }) {
@@ -397,12 +639,13 @@ function EmployeeRows({
           }
 
           const key = column.key;
+          const value = key === "punch" ? row[key].replace(/; /g, "\n") : row[key];
           return (
             <td key={key} className="border border-slate-200 p-1 align-top">
               <textarea
                 aria-label={`${column.label} của dòng ${index + 1}`}
-                value={row[key]}
-                rows={1}
+                value={value}
+                rows={key === "punch" ? Math.max(1, value.split("\n").length) : 1}
                 onChange={(event) => onChange(key, event.target.value)}
                 className={`field-sizing-content min-h-8 w-full resize-none bg-transparent px-2 py-2 text-sm text-slate-900 outline-none focus:bg-amber-50 ${
                   column.bold ? "font-semibold" : ""
@@ -439,15 +682,20 @@ function EmployeeRows({
                   <tr>
                     {days.map((day) => {
                       const note = noteByDate.get(formatDate(day));
+                      const excused = isExcludedDate(day, excluded);
+                      const punchIssue = note?.session === punchNoteSession;
                       const punches = [...day.punches].sort();
                       return (
                         <td
                           key={`punch-${day.day}`}
-                          className={`border border-slate-200 px-1 py-1 align-top leading-4 ${note ? "bg-amber-50" : ""}`}
+                          className={`border border-slate-200 px-1 py-1 align-top leading-4 ${excused ? "bg-emerald-50" : ""} ${
+                            !excused && punchIssue ? "bg-sky-50" : ""
+                          } ${!excused && note && !punchIssue ? "bg-amber-50" : ""}`}
                         >
                           {punches.map((punch, punchIndex) => (
                             <div key={`${punch}-${punchIndex}`}>{punch}</div>
                           ))}
+                          {excused ? <div className="font-medium text-emerald-800">đi làm</div> : null}
                         </td>
                       );
                     })}
@@ -455,19 +703,39 @@ function EmployeeRows({
                 </tbody>
               </table>
             </div>
-            <div className="mt-3">
-              <p className="text-sm font-semibold text-amber-950">Ghi chú ngày nghỉ</p>
-              {notes.length === 0 ? (
-                <p className="mt-1 text-sm text-slate-500">Không có ngày nghỉ.</p>
-              ) : (
-                <ul className="mt-2 flex flex-col gap-1 text-sm text-amber-950">
-                  {notes.map((note) => (
-                    <li key={`${note.dateLabel}-${note.session}`}>
-                      {note.session} {note.dateLabel} — {note.detail}
-                    </li>
-                  ))}
-                </ul>
-              )}
+            <div className="mt-3 grid gap-4 lg:grid-cols-2">
+              <div>
+                <p className="text-sm font-semibold text-amber-950">Ghi chú ngày nghỉ</p>
+                {notes.filter((note) => note.session !== punchNoteSession).length === 0 ? (
+                  <p className="mt-1 text-sm text-slate-500">Không có ngày nghỉ.</p>
+                ) : (
+                  <ul className="mt-2 flex flex-col gap-1 text-sm text-amber-950">
+                    {notes
+                      .filter((note) => note.session !== punchNoteSession)
+                      .map((note) => (
+                        <li key={`${note.dateLabel}-${note.session}`}>
+                          {note.session} {note.dateLabel} — {note.detail}
+                        </li>
+                      ))}
+                  </ul>
+                )}
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-sky-950">Quên / Không chấm công</p>
+                {notes.filter((note) => note.session === punchNoteSession).length === 0 ? (
+                  <p className="mt-1 text-sm text-slate-500">Không có ngày quên chấm hoặc lệch giờ.</p>
+                ) : (
+                  <ul className="mt-2 flex flex-col gap-1 text-sm text-sky-950">
+                    {notes
+                      .filter((note) => note.session === punchNoteSession)
+                      .map((note) => (
+                        <li key={`${note.dateLabel}-${note.session}`}>
+                          {note.dateLabel} — {note.detail}
+                        </li>
+                      ))}
+                  </ul>
+                )}
+              </div>
             </div>
             </div>
           </td>

@@ -33,8 +33,11 @@ export type SummaryRow = {
   morning: string;
   afternoon: string;
   fullDay: string;
+  punch: string;
   total: number | string;
 };
+
+export const punchNoteSession = "quên chấm";
 
 export type ReviewNote = {
   name: string;
@@ -48,6 +51,11 @@ export type AttendanceSummary = {
   periodLabel: string;
   rows: SummaryRow[];
   notes: ReviewNote[];
+};
+
+export type ExcludedSpan = {
+  start: CalendarDate;
+  end: CalendarDate;
 };
 
 type Sheet = {
@@ -133,16 +141,22 @@ export function countListedDays(text: string): number {
 export function notesMatchingRows(
   notes: ReviewNote[],
   sourceRows: Array<{ name: string }>,
-  editedRows: Array<{ name: string; morning: string; afternoon: string; fullDay: string }>,
+  editedRows: Array<{ name: string; morning: string; afternoon: string; fullDay: string; punch?: string }>,
 ): ReviewNote[] {
   return notes.flatMap((note) => {
     const index = sourceRows.findIndex((row) => row.name === note.name);
     const edited = editedRows[index];
     if (!edited) return [];
-    const text =
-      note.session === "sáng" ? edited.morning : note.session === "chiều" ? edited.afternoon : edited.fullDay;
     const label = note.dateLabel.match(/^(\d{1,2})\/(\d{1,2})$/);
     if (!label) return [];
+    if (note.session === punchNoteSession) {
+      const listed = (edited.punch ?? "")
+        .split(/[;\n]+/)
+        .some((part) => part.trim().startsWith(note.dateLabel));
+      return listed ? [{ ...note, name: edited.name }] : [];
+    }
+    const text =
+      note.session === "sáng" ? edited.morning : note.session === "chiều" ? edited.afternoon : edited.fullDay;
     const key = dateTokenKey(Number(label[2]), Number(label[1]));
     if (!listedDateKeys(text).has(key)) return [];
     return [{ ...note, name: edited.name }];
@@ -155,6 +169,35 @@ export function leaveTotal(morning: string, afternoon: string, fullDay: string):
 
 function dateKey(date: CalendarDate): number {
   return date.year * 10000 + date.month * 100 + date.day;
+}
+
+function isRealDate(date: CalendarDate): boolean {
+  if (!Number.isInteger(date.year) || !Number.isInteger(date.month) || !Number.isInteger(date.day)) return false;
+  if (date.year < 2000 || date.year > 2100) return false;
+  const utc = new Date(Date.UTC(date.year, date.month - 1, date.day));
+  return utc.getUTCFullYear() === date.year && utc.getUTCMonth() === date.month - 1 && utc.getUTCDate() === date.day;
+}
+
+export function toIsoDate(date: CalendarDate): string {
+  return `${date.year}-${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}`;
+}
+
+export function parseIsoDate(value: string): CalendarDate | null {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const date = { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+  return isRealDate(date) ? date : null;
+}
+
+export function normalizeExcludedSpan(start: CalendarDate, end: CalendarDate): ExcludedSpan | null {
+  if (!isRealDate(start) || !isRealDate(end)) return null;
+  if (dateKey(end) < dateKey(start)) return { start: { ...end }, end: { ...start } };
+  return { start: { ...start }, end: { ...end } };
+}
+
+export function isExcludedDate(date: CalendarDate, spans: ExcludedSpan[]): boolean {
+  const key = dateKey(date);
+  return spans.some((span) => key >= dateKey(span.start) && key <= dateKey(span.end));
 }
 
 function weekdayOf(date: CalendarDate): number {
@@ -309,11 +352,6 @@ export function parseWorkbook(sheets: Sheet[]): ParsedAttendance {
 
 type AbsenceKind = "morning" | "afternoon" | "full";
 
-type ClassifiedDay = {
-  date: CalendarDate;
-  kind: AbsenceKind;
-};
-
 function sessionLabel(kind: AbsenceKind): string {
   if (kind === "morning") return "sáng";
   if (kind === "afternoon") return "chiều";
@@ -350,35 +388,69 @@ function describeLeave(day: PunchDay, kind: AbsenceKind, grace: number): string 
   return `vào lúc ${arrived}, về lúc ${left}`;
 }
 
-function coversMorning(first: number, last: number, grace: number): boolean {
-  return first <= MORNING_START + grace && last >= MORNING_END - grace;
+type DayAssessment =
+  | { kind: "leave"; absence: AbsenceKind }
+  | { kind: "punch"; detail: string };
+
+function latePhrase(minutes: number, deadline: number): string {
+  return `đến muộn ${minutes} phút so với ${formatMinutes(deadline)}`;
 }
 
-function coversAfternoon(first: number, last: number, grace: number): boolean {
-  return first <= AFTERNOON_START + grace && last >= AFTERNOON_END - grace;
+function earlyPhrase(minutes: number, deadline: number): string {
+  return `về sớm ${minutes} phút so với ${formatMinutes(deadline)}`;
 }
 
-function classifyDay(day: PunchDay, grace: number): ClassifiedDay | null {
+function invalidPhrase(times: string[]): string {
+  return `chấm không hợp lệ (${times.join(", ")})`;
+}
+
+function assessDay(day: PunchDay, grace: number): DayAssessment | null {
   if (day.weekday === 0) return null;
-  const times = sortedPunches(day).filter(acceptPunch).map(toMinutes);
+  const punches = sortedPunches(day);
+  const valid = punches.filter(acceptPunch);
+  const invalid = punches.filter((time) => !acceptPunch(time));
   const saturday = day.weekday === 6;
+  const inBy = MORNING_START + grace;
+  const outFrom = (saturday ? MORNING_END : AFTERNOON_END) - grace;
 
-  if (times.length <= 1) {
-    return { date: day, kind: saturday ? "morning" : "full" };
+  if (valid.length === 0) {
+    if (invalid.length > 0) return { kind: "punch", detail: invalidPhrase(invalid) };
+    return { kind: "leave", absence: saturday ? "morning" : "full" };
   }
 
-  const first = times[0];
-  const last = times[times.length - 1];
-  const morning = coversMorning(first, last, grace);
+  if (valid.length === 1) {
+    const minutes = toMinutes(valid[0]);
+    const forgot: string[] = [];
+    if (minutes > inBy) forgot.push("quên chấm vào");
+    if (minutes < outFrom) forgot.push("quên chấm ra");
+    if (forgot.length === 0) forgot.push(minutes <= inBy ? "quên chấm ra" : "quên chấm vào");
+    const parts = [`${forgot.join(", ")} (chấm lúc ${valid[0]})`];
+    if (invalid.length > 0) parts.push(invalidPhrase(invalid));
+    return { kind: "punch", detail: parts.join(", ") };
+  }
+
+  const first = toMinutes(valid[0]);
+  const last = toMinutes(valid[valid.length - 1]);
+  const morningAttended =
+    first < MORNING_END && last >= MORNING_START && (saturday || last >= MORNING_END - grace || last >= AFTERNOON_START);
+  const afternoonAttended = !saturday && first < AFTERNOON_END && last >= AFTERNOON_START;
+
   if (saturday) {
-    return morning ? null : { date: day, kind: "morning" };
+    if (!morningAttended) return { kind: "leave", absence: "morning" };
+  } else if (!morningAttended && !afternoonAttended) {
+    return { kind: "leave", absence: "full" };
+  } else if (!morningAttended) {
+    return { kind: "leave", absence: "morning" };
+  } else if (!afternoonAttended) {
+    return { kind: "leave", absence: "afternoon" };
   }
 
-  const afternoon = coversAfternoon(first, last, grace);
-  if (morning && afternoon) return null;
-  if (!morning && !afternoon) return { date: day, kind: "full" };
-  if (!morning) return { date: day, kind: "morning" };
-  return { date: day, kind: "afternoon" };
+  const parts: string[] = [];
+  if (first > inBy) parts.push(latePhrase(first - inBy, inBy));
+  if (last < outFrom) parts.push(earlyPhrase(outFrom - last, outFrom));
+  if (invalid.length > 0) parts.push(invalidPhrase(invalid));
+  if (parts.length === 0) return null;
+  return { kind: "punch", detail: parts.join(", ") };
 }
 
 function groupDates(dates: CalendarDate[]): string {
@@ -406,7 +478,11 @@ function groupDates(dates: CalendarDate[]): string {
   return parts.join(", ");
 }
 
-export function summarize(parsed: ParsedAttendance, graceMinutes: number): AttendanceSummary {
+export function summarize(
+  parsed: ParsedAttendance,
+  graceMinutes: number,
+  excluded: ExcludedSpan[] = [],
+): AttendanceSummary {
   const grace = Number.isFinite(graceMinutes) ? Math.max(0, Math.round(graceMinutes)) : 0;
   const rows: SummaryRow[] = [];
   const notes: ReviewNote[] = [];
@@ -415,18 +491,30 @@ export function summarize(parsed: ParsedAttendance, graceMinutes: number): Atten
     const morning: CalendarDate[] = [];
     const afternoon: CalendarDate[] = [];
     const full: CalendarDate[] = [];
+    const punchNotes: Array<{ date: CalendarDate; detail: string }> = [];
 
     for (const day of employee.days) {
-      const classified = classifyDay(day, grace);
-      if (!classified) continue;
-      if (classified.kind === "morning") morning.push(classified.date);
-      if (classified.kind === "afternoon") afternoon.push(classified.date);
-      if (classified.kind === "full") full.push(classified.date);
+      if (isExcludedDate(day, excluded)) continue;
+      const assessed = assessDay(day, grace);
+      if (!assessed) continue;
+      if (assessed.kind === "leave") {
+        if (assessed.absence === "morning") morning.push(day);
+        if (assessed.absence === "afternoon") afternoon.push(day);
+        if (assessed.absence === "full") full.push(day);
+        notes.push({
+          name: employee.name,
+          dateLabel: formatDate(day),
+          session: sessionLabel(assessed.absence),
+          detail: describeLeave(day, assessed.absence, grace),
+        });
+        continue;
+      }
+      punchNotes.push({ date: day, detail: assessed.detail });
       notes.push({
         name: employee.name,
-        dateLabel: formatDate(classified.date),
-        session: sessionLabel(classified.kind),
-        detail: describeLeave(day, classified.kind, grace),
+        dateLabel: formatDate(day),
+        session: punchNoteSession,
+        detail: assessed.detail,
       });
     }
 
@@ -436,6 +524,10 @@ export function summarize(parsed: ParsedAttendance, graceMinutes: number): Atten
       morning: groupDates(morning),
       afternoon: groupDates(afternoon),
       fullDay: groupDates(full),
+      punch: [...punchNotes]
+        .sort((left, right) => dateKey(left.date) - dateKey(right.date))
+        .map((item) => `${formatDate(item.date)} ${item.detail}`)
+        .join("\n"),
       total,
     });
   }
