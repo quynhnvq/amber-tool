@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import { DateField } from "@/components/date-field";
+import type { ExportedAttendance } from "@/lib/export-summary";
 import {
   formatDate,
   formatTotal,
@@ -25,7 +26,6 @@ import {
 } from "@/lib/attendance";
 
 const graceKey = "amber-tool.grace-minutes";
-const includeNotesKey = "amber-tool.include-notes";
 const excludedKey = "amber-tool.excluded-spans";
 const defaultGrace = 15;
 const emptyExcluded: ExcludedSpan[] = [];
@@ -42,14 +42,6 @@ function readGrace(): number {
     return clampGrace(Number(raw));
   } catch {
     return defaultGrace;
-  }
-}
-
-function readIncludeNotes(): boolean {
-  try {
-    return localStorage.getItem(includeNotesKey) === "1";
-  } catch {
-    return false;
   }
 }
 
@@ -213,7 +205,7 @@ export function AttendanceTool() {
     }
   }
 
-  async function onExport(current: AttendanceSummary & { includeNotes?: boolean }) {
+  async function onExport(current: AttendanceSummary & { attendance: ExportedAttendance[] }) {
     setExporting(true);
     setError("");
     try {
@@ -477,10 +469,9 @@ function Result({
   employees: ParsedEmployee[];
   excluded: ExcludedSpan[];
   exporting: boolean;
-  onExport: (summary: AttendanceSummary & { includeNotes?: boolean }) => void;
+  onExport: (summary: AttendanceSummary & { attendance: ExportedAttendance[] }) => void;
 }) {
   const [rows, setRows] = useState<DraftRow[]>(() => toDraft(summary));
-  const [includeNotes, setIncludeNotes] = useState(readIncludeNotes);
   const [openRows, setOpenRows] = useState<Record<number, boolean>>({});
   const [renderedSummary, setRenderedSummary] = useState(summary);
 
@@ -489,14 +480,6 @@ function Result({
     setRows(toDraft(summary));
     setOpenRows({});
   }
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(includeNotesKey, includeNotes ? "1" : "0");
-    } catch {
-      // Keep the in-page choice when storage is unavailable.
-    }
-  }, [includeNotes]);
 
   const notesByRow = useMemo(
     () =>
@@ -532,25 +515,30 @@ function Result({
             Bấm vào ô để sửa. Tổng ngày nghỉ tính lại theo sáng và chiều 0,5 ngày, nguyên ngày 1 ngày. Cột Quên / Không chấm công không cộng vào tổng này. Mũi tên cạnh tên mở giờ chấm công và ghi chú.
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            className="h-11 rounded-lg bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
-            disabled={exporting}
-            onClick={() => onExport({ ...summary, rows, notes, includeNotes })}
-          >
-            {exporting ? "Đang xuất..." : "Xuất file .xlsx"}
-          </button>
-          <label className="flex items-center gap-2 text-sm text-slate-700">
-            <input
-              type="checkbox"
-              className="size-4 accent-slate-900"
-              checked={includeNotes}
-              onChange={(event) => setIncludeNotes(event.target.checked)}
-            />
-            Xuất kèm ghi chú
-          </label>
-        </div>
+        <button
+          type="button"
+          className="h-11 rounded-lg bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
+          disabled={exporting}
+          onClick={() =>
+            onExport({
+              ...summary,
+              rows,
+              notes,
+              attendance: employees.map((employee, index) => ({
+                name: rows[index]?.name || employee.name,
+                days: employee.days.map((day) => ({
+                  day: day.day,
+                  weekday: day.weekday,
+                  label: formatDate(day),
+                  punches: [...day.punches].sort(),
+                  excused: isExcludedDate(day, excluded),
+                })),
+              })),
+            })
+          }
+        >
+          {exporting ? "Đang xuất..." : "Xuất file .xlsx"}
+        </button>
       </div>
 
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
